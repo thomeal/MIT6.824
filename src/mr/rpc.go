@@ -22,6 +22,14 @@ type ExampleReply struct {
 	Y int
 }
 
+type TaskInfo struct {
+	id       int
+	filename string
+	jobPhase string
+	done     bool
+	nReduce  int
+}
+
 // Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name

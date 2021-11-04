@@ -7,7 +7,9 @@ import "net/rpc"
 import "net/http"
 
 type Coordinator struct {
-	// Your definitions here.
+}
+
+func (*Coordinator) ServeHTTP(writer http.ResponseWriter, res *http.Request) {
 
 }
 
@@ -36,7 +38,7 @@ func (c *Coordinator) server() {
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
-	go http.Serve(l, nil)
+	go http.Serve(l, &Coordinator{})
 }
 
 //

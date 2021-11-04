@@ -1,8 +1,14 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"io/ioutil"
+	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+)
 import "log"
-import "net/rpc"
 import "hash/fnv"
 
 //
@@ -12,6 +18,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -26,37 +40,106 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for {
+		var taskInfo TaskInfo
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		call("register", nil, &taskInfo)
 
+		if taskInfo.done {
+			return
+		}
+
+		handleJob(&taskInfo, mapf, reducef)
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func handleJob(info *TaskInfo, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	switch info.jobPhase {
+	case "Map":
+		doMap(info, mapf)
+		break
+	case "Reduce":
+		doReduce(info, reducef)
+		break
+	default:
+		call("Error", &info, nil)
+		log.Fatal("Unknown job")
+	}
+}
 
-	// fill in the argument(s).
-	args.X = 99
+func doMap(info *TaskInfo, mapf func(string, string) []KeyValue) {
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	kva := mapf(info.filename, string(readFile(info.filename)))
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
+	intermediate := make([][]KeyValue, info.nReduce)
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	for i := 0; i < len(kva); i++ {
+		intermediate[ihash(kva[i].Key)%info.nReduce] = append(intermediate[ihash(kva[i].Key)%info.nReduce], kva[i])
+	}
+
+	for i := 0; i < info.nReduce; i++ {
+		writeFile(fmt.Sprintf("mr-tmp-%d", i+1), intermediate[i])
+	}
+
+	call("done", info, nil)
+}
+
+func doReduce(info *TaskInfo, reducef func(string, []string) string) {
+	content := strings.Split(string(readFile(info.filename)), "\n")
+
+	intermediate := make([]KeyValue, len(content))
+
+	for _, kvString := range content {
+		kvList := strings.Split(kvString, " ")
+		kv := KeyValue{kvList[0], kvList[1]}
+		intermediate = append(intermediate, kv)
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	result := []KeyValue{}
+
+	for i := 0; i < len(intermediate); i++ {
+		values := []string{}
+		kv := intermediate[i]
+
+		for j := 0; j < len(intermediate) && intermediate[j].Key == intermediate[i].Key; j++ {
+			values = append(values, intermediate[j].Value)
+		}
+
+		result = append(result, KeyValue{kv.Key, reducef(intermediate[i].Key, values)})
+	}
+
+	writeFile(fmt.Sprintf("mr-out-%d", info.id), result)
+
+	call("done", info, nil)
+}
+
+func readFile(filename string) []byte {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	return content
+}
+
+func writeFile(fileName string, data []KeyValue) {
+	ofile, _ := os.Create(fileName)
+
+	for i := 0; i < len(data); i++ {
+		fmt.Fprintf(ofile, "%v %v\n", data[i].Key, data[i])
+	}
+
+	ofile.Close()
 }
 
 //
