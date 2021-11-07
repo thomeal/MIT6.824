@@ -1,12 +1,15 @@
 package mr
 
 import (
+	"encoding/gob"
 	"fmt"
 	"io/ioutil"
 	"net/rpc"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 import "log"
 import "hash/fnv"
@@ -41,23 +44,29 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	gob.Register(TaskInfo{})
+	gob.Register(Empty{})
 
 	for {
 		var taskInfo TaskInfo
 
-		call("register", nil, &taskInfo)
+		call("Register", *new(Empty), &taskInfo)
 
-		if taskInfo.done {
+		if !taskInfo.Working {
 			return
 		}
 
-		handleJob(&taskInfo, mapf, reducef)
+		if taskInfo.Assigned {
+			handleJob(taskInfo, mapf, reducef)
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
-func handleJob(info *TaskInfo, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+func handleJob(info TaskInfo, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	switch info.jobPhase {
+	switch info.JobPhase {
 	case "Map":
 		doMap(info, mapf)
 		break
@@ -65,57 +74,78 @@ func handleJob(info *TaskInfo, mapf func(string, string) []KeyValue, reducef fun
 		doReduce(info, reducef)
 		break
 	default:
-		call("Error", &info, nil)
-		log.Fatal("Unknown job")
+		//call("Error", &info, nil)
+		log.Fatal("Unknown job: " + info.JobPhase)
 	}
 }
 
-func doMap(info *TaskInfo, mapf func(string, string) []KeyValue) {
+func doMap(info TaskInfo, mapf func(string, string) []KeyValue) {
 
-	kva := mapf(info.filename, string(readFile(info.filename)))
+	kva := mapf(info.FileName, string(readFile(info.FileName)))
 
-	intermediate := make([][]KeyValue, info.nReduce)
+	intermediate := make([][]KeyValue, info.NReduce)
 
 	for i := 0; i < len(kva); i++ {
-		intermediate[ihash(kva[i].Key)%info.nReduce] = append(intermediate[ihash(kva[i].Key)%info.nReduce], kva[i])
+		intermediate[ihash(kva[i].Key)%info.NReduce] = append(intermediate[ihash(kva[i].Key)%info.NReduce], kva[i])
 	}
 
-	for i := 0; i < info.nReduce; i++ {
-		writeFile(fmt.Sprintf("mr-tmp-%d", i+1), intermediate[i])
+	for i := 0; i < info.NReduce; i++ {
+		writeFile(fmt.Sprintf("mr-tmp-%d-%d", i, info.ID), intermediate[i])
 	}
 
-	call("done", info, nil)
+	call("Finished", info, new(Empty))
 }
 
-func doReduce(info *TaskInfo, reducef func(string, []string) string) {
-	content := strings.Split(string(readFile(info.filename)), "\n")
+func doReduce(info TaskInfo, reducef func(string, []string) string) {
+	content := strings.Split(readIntermediateFiles(info.ID), "\n")
 
-	intermediate := make([]KeyValue, len(content))
+	var intermediate []KeyValue
 
 	for _, kvString := range content {
 		kvList := strings.Split(kvString, " ")
-		kv := KeyValue{kvList[0], kvList[1]}
-		intermediate = append(intermediate, kv)
+
+		if len(kvList) >= 2 {
+			kv := KeyValue{kvList[0], kvList[1]}
+			intermediate = append(intermediate, kv)
+		}
 	}
 
 	sort.Sort(ByKey(intermediate))
 
-	result := []KeyValue{}
+	var result []KeyValue
 
 	for i := 0; i < len(intermediate); i++ {
-		values := []string{}
+		var values []string
 		kv := intermediate[i]
 
-		for j := 0; j < len(intermediate) && intermediate[j].Key == intermediate[i].Key; j++ {
+		j := i
+
+		for ; j < len(intermediate) && intermediate[j].Key == intermediate[i].Key; j++ {
 			values = append(values, intermediate[j].Value)
 		}
 
 		result = append(result, KeyValue{kv.Key, reducef(intermediate[i].Key, values)})
+
+		i = j - 1
 	}
 
-	writeFile(fmt.Sprintf("mr-out-%d", info.id), result)
+	writeFile(fmt.Sprintf("mr-out-%d", info.ID), result)
 
-	call("done", info, nil)
+	call("Finished", &info, new(Empty))
+}
+
+func readIntermediateFiles(id int) string {
+	files, _ := ioutil.ReadDir("./")
+
+	content := ""
+
+	for _, file := range files {
+		if strings.Contains(file.Name(), "mr-tmp-"+strconv.Itoa(id)) {
+			content += string(readFile(file.Name()))
+		}
+	}
+
+	return content
 }
 
 func readFile(filename string) []byte {
@@ -136,7 +166,7 @@ func writeFile(fileName string, data []KeyValue) {
 	ofile, _ := os.Create(fileName)
 
 	for i := 0; i < len(data); i++ {
-		fmt.Fprintf(ofile, "%v %v\n", data[i].Key, data[i])
+		fmt.Fprintf(ofile, "%v %v\n", data[i].Key, data[i].Value)
 	}
 
 	ofile.Close()
@@ -147,7 +177,7 @@ func writeFile(fileName string, data []KeyValue) {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(rpcName string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -156,7 +186,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	defer c.Close()
 
-	err = c.Call(rpcname, args, reply)
+	err = c.Call("Coordinator."+rpcName, args, reply)
 	if err == nil {
 		return true
 	}
