@@ -1,8 +1,16 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/gob"
+	"fmt"
+	"io/ioutil"
+	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
 import "log"
-import "net/rpc"
 import "hash/fnv"
 
 //
@@ -12,6 +20,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -26,37 +42,138 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	gob.Register(TaskInfo{})
+	gob.Register(Empty{})
 
-	// Your worker implementation here.
+	for {
+		var taskInfo TaskInfo
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		call("Register", *new(Empty), &taskInfo)
 
+		if !taskInfo.Working {
+			return
+		}
+
+		if taskInfo.Assigned {
+			handleJob(taskInfo, mapf, reducef)
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func handleJob(info TaskInfo, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	switch info.JobPhase {
+	case "Map":
+		doMap(info, mapf)
+		break
+	case "Reduce":
+		doReduce(info, reducef)
+		break
+	default:
+		//call("Error", &info, nil)
+		log.Fatal("Unknown job: " + info.JobPhase)
+	}
+}
 
-	// fill in the argument(s).
-	args.X = 99
+func doMap(info TaskInfo, mapf func(string, string) []KeyValue) {
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	kva := mapf(info.FileName, string(readFile(info.FileName)))
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
+	intermediate := make([][]KeyValue, info.NReduce)
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	for i := 0; i < len(kva); i++ {
+		intermediate[ihash(kva[i].Key)%info.NReduce] = append(intermediate[ihash(kva[i].Key)%info.NReduce], kva[i])
+	}
+
+	for i := 0; i < info.NReduce; i++ {
+		writeFile(fmt.Sprintf("mr-tmp-%d-%d", i, info.ID), intermediate[i])
+	}
+
+	call("Finished", info, new(Empty))
+}
+
+func doReduce(info TaskInfo, reducef func(string, []string) string) {
+	content := strings.Split(readIntermediateFiles(info.FileName), "\n")
+
+	var intermediate []KeyValue
+
+	for _, kvString := range content {
+		kvList := strings.Split(kvString, " ")
+
+		if len(kvList) >= 2 {
+			kv := KeyValue{kvList[0], kvList[1]}
+			intermediate = append(intermediate, kv)
+		}
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	var result []KeyValue
+
+	for i := 0; i < len(intermediate); i++ {
+		var values []string
+		kv := intermediate[i]
+
+		j := i
+
+		for ; j < len(intermediate) && intermediate[j].Key == intermediate[i].Key; j++ {
+			values = append(values, intermediate[j].Value)
+		}
+
+		result = append(result, KeyValue{kv.Key, reducef(intermediate[i].Key, values)})
+
+		i = j - 1
+	}
+
+	writeFile(strings.ReplaceAll(info.FileName, "tmp", "out"), result)
+
+	call("Finished", &info, new(Empty))
+}
+
+func readIntermediateFiles(filename string) string {
+	files, _ := ioutil.ReadDir("./")
+
+	content := ""
+
+	for _, file := range files {
+		if strings.Contains(file.Name(), filename) {
+			content += string(readFile(file.Name()))
+		}
+	}
+
+	return content
+}
+
+func readFile(filename string) []byte {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	return content
+}
+
+func writeFile(fileName string, data []KeyValue) {
+	tmpFile, _ := ioutil.TempFile("./", fileName+".tmp.*.txt")
+
+	for i := 0; i < len(data); i++ {
+		fmt.Fprintf(tmpFile, "%v %v\n", data[i].Key, data[i].Value)
+	}
+
+	err := os.Rename(tmpFile.Name(), fileName)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	tmpFile.Close()
 }
 
 //
@@ -64,7 +181,7 @@ func CallExample() {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(rpcName string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -73,7 +190,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	}
 	defer c.Close()
 
-	err = c.Call(rpcname, args, reply)
+	err = c.Call("Coordinator."+rpcName, args, reply)
 	if err == nil {
 		return true
 	}
