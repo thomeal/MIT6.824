@@ -7,7 +7,6 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -97,7 +96,7 @@ func doMap(info TaskInfo, mapf func(string, string) []KeyValue) {
 }
 
 func doReduce(info TaskInfo, reducef func(string, []string) string) {
-	content := strings.Split(readIntermediateFiles(info.ID), "\n")
+	content := strings.Split(readIntermediateFiles(info.FileName), "\n")
 
 	var intermediate []KeyValue
 
@@ -129,18 +128,18 @@ func doReduce(info TaskInfo, reducef func(string, []string) string) {
 		i = j - 1
 	}
 
-	writeFile(fmt.Sprintf("mr-out-%d", info.ID), result)
+	writeFile(strings.ReplaceAll(info.FileName, "tmp", "out"), result)
 
 	call("Finished", &info, new(Empty))
 }
 
-func readIntermediateFiles(id int) string {
+func readIntermediateFiles(filename string) string {
 	files, _ := ioutil.ReadDir("./")
 
 	content := ""
 
 	for _, file := range files {
-		if strings.Contains(file.Name(), "mr-tmp-"+strconv.Itoa(id)) {
+		if strings.Contains(file.Name(), filename) {
 			content += string(readFile(file.Name()))
 		}
 	}
@@ -163,13 +162,18 @@ func readFile(filename string) []byte {
 }
 
 func writeFile(fileName string, data []KeyValue) {
-	ofile, _ := os.Create(fileName)
+	tmpFile, _ := ioutil.TempFile("./", fileName+".tmp.*.txt")
 
 	for i := 0; i < len(data); i++ {
-		fmt.Fprintf(ofile, "%v %v\n", data[i].Key, data[i].Value)
+		fmt.Fprintf(tmpFile, "%v %v\n", data[i].Key, data[i].Value)
 	}
 
-	ofile.Close()
+	err := os.Rename(tmpFile.Name(), fileName)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	tmpFile.Close()
 }
 
 //

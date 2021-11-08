@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -13,13 +14,25 @@ import "net/http"
 
 type Coordinator struct {
 	nReduce      int
-	taskNum      int
-	jobList      []string
-	finishedJobs []int
+	jobIndex     int
+	jobList      []*JobInfo
+	finishedJobs map[JobKey]bool
+	jobNum       int
 	jobPhase     string
 	finished     bool
 	mux          sync.Mutex
 }
+
+type JobKey string
+
+type JobInfo struct {
+	id        int
+	key       string
+	start     int
+	hasBackup bool
+}
+
+var id = 0
 
 // Your code here -- RPC handlers for the worker to call.
 
@@ -36,13 +49,16 @@ func (coordinator *Coordinator) Register(_ Empty, reply *TaskInfo) error {
 
 	if coordinator.finished {
 		reply.Working = false
-	} else if coordinator.taskNum < len(coordinator.jobList) {
+	} else if coordinator.jobIndex < len(coordinator.jobList) {
 		reply.NReduce = coordinator.nReduce
-		reply.FileName = coordinator.jobList[coordinator.taskNum]
+		reply.FileName = coordinator.jobList[coordinator.jobIndex].key
 		reply.JobPhase = coordinator.jobPhase
-		reply.ID = coordinator.taskNum
+		reply.ID = id
 
-		coordinator.taskNum += 1
+		coordinator.jobList[coordinator.jobIndex].start = int(time.Now().Unix())
+		coordinator.jobList[coordinator.jobIndex].id = reply.ID
+		coordinator.jobIndex += 1
+		id += 1
 	} else {
 		reply.Assigned = false
 	}
@@ -57,10 +73,10 @@ func (coordinator *Coordinator) Finished(args TaskInfo, _ *Empty) error {
 
 	coordinator.mux.Lock()
 
-	coordinator.finishedJobs = append(coordinator.finishedJobs, args.ID)
+	coordinator.finishedJobs[JobKey(args.FileName)] = true
 
 	// when all the jobs are finished, switch to the next job phase
-	if coordinator.taskNum >= len(coordinator.jobList) {
+	if len(coordinator.finishedJobs) == coordinator.jobNum {
 		var jobList []string
 		if coordinator.jobPhase == "Map" {
 			jobList = getIntermediateFiles(coordinator.nReduce)
@@ -75,12 +91,44 @@ func (coordinator *Coordinator) Finished(args TaskInfo, _ *Empty) error {
 }
 
 func (coordinator *Coordinator) init(files []string, nReduce int) {
-	coordinator.finishedJobs = []int{}
-	coordinator.jobList = files
+	coordinator.jobList = []*JobInfo{}
+
+	for _, file := range files {
+		coordinator.jobList = append(coordinator.jobList, &JobInfo{key: file})
+	}
+
 	coordinator.jobPhase = nextJobPhase(coordinator.jobPhase)
-	coordinator.taskNum = 0
+	coordinator.jobIndex = 0
+	coordinator.finishedJobs = map[JobKey]bool{}
 	coordinator.nReduce = nReduce
 	coordinator.finished = coordinator.jobPhase == "Finished"
+	coordinator.jobNum = len(coordinator.jobList)
+}
+
+func (coordinator *Coordinator) checkJobs() {
+	for {
+		time.Sleep(10 * time.Second)
+
+		coordinator.mux.Lock()
+
+		var executingJobs []*JobInfo
+		var backupJobs []*JobInfo
+
+		for _, job := range coordinator.jobList {
+			if !coordinator.finishedJobs[JobKey(job.key)] {
+				executingJobs = append(executingJobs, job)
+				if !job.hasBackup && int(time.Now().Unix())-job.start >= 10 {
+					job.hasBackup = true
+					backupJobs = append(backupJobs, &JobInfo{key: job.key})
+				}
+			}
+		}
+
+		coordinator.jobIndex = len(executingJobs)
+		coordinator.jobList = append(executingJobs, backupJobs...)
+
+		coordinator.mux.Unlock()
+	}
 }
 
 //
@@ -142,6 +190,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := new(Coordinator)
 
 	c.init(files, nReduce)
+
+	go c.checkJobs()
+
+	fmt.Println("inited")
 
 	// Your code here.
 
